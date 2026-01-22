@@ -1,7 +1,7 @@
 import sqlite3
 import logging
 from datetime import datetime, timedelta
-from config import DB_PATH, TASK_COOLDOWN_HOURS, ADMIN_IDS
+from config import DB_PATH, TASK_COOLDOWN_HOURS, ADMIN_BONUS_PER_REVIEW
 
 logger = logging.getLogger(__name__)
 
@@ -11,25 +11,11 @@ class Database:
         self.conn = sqlite3.connect(DB_PATH, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self.create_tables()
-        self.update_admin_balances()
-
-    def update_admin_balances(self):
-        """Обновляет балансы админов, если они не существуют в базе"""
-        cursor = self.conn.cursor()
-        for admin_id in ADMIN_IDS:
-            cursor.execute('SELECT 1 FROM users WHERE user_id = ?', (admin_id,))
-            if not cursor.fetchone():
-                # Добавляем админа в базу
-                cursor.execute('''
-                    INSERT INTO users (user_id, username, full_name, balance, registered_at, is_admin)
-                    VALUES (?, 'admin', 'Administrator', 0, ?, 1)
-                ''', (admin_id, datetime.now()))
-        self.conn.commit()
 
     def create_tables(self):
         cursor = self.conn.cursor()
 
-        # Пользователи (добавлено поле is_admin)
+        # Пользователи
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS users (
                 user_id INTEGER PRIMARY KEY,
@@ -40,8 +26,7 @@ class Database:
                 pending_reviews INTEGER DEFAULT 0,
                 registered_at TIMESTAMP,
                 referral_code TEXT UNIQUE,
-                referred_by INTEGER,
-                is_admin BOOLEAN DEFAULT 0
+                referred_by INTEGER
             )
         ''')
 
@@ -72,6 +57,7 @@ class Database:
                 status TEXT DEFAULT 'pending',
                 submitted_at TIMESTAMP,
                 checked_at TIMESTAMP,
+                admin_id INTEGER,
                 FOREIGN KEY (user_id) REFERENCES users (user_id),
                 FOREIGN KEY (task_id) REFERENCES tasks (task_id)
             )
@@ -133,16 +119,10 @@ class Database:
             )
         ''')
 
-        # Добавляем столбец is_admin, если его нет
-        try:
-            cursor.execute('SELECT is_admin FROM users LIMIT 1')
-        except sqlite3.OperationalError:
-            cursor.execute('ALTER TABLE users ADD COLUMN is_admin BOOLEAN DEFAULT 0')
-
         self.conn.commit()
 
     # Методы для пользователей
-    def add_user(self, user_id, username, full_name, referral_code=None, referred_by=None, is_admin=False):
+    def add_user(self, user_id, username, full_name, referral_code=None, referred_by=None):
         cursor = self.conn.cursor()
 
         if referral_code is None:
@@ -150,17 +130,11 @@ class Database:
             import string
             referral_code = ''.join(random.choices(string.ascii_letters + string.digits, k=8))
 
-        # Проверяем, является ли пользователь админом
-        if is_admin or user_id in ADMIN_IDS:
-            admin_status = 1
-        else:
-            admin_status = 0
-
         try:
             cursor.execute('''
-                INSERT INTO users (user_id, username, full_name, registered_at, referral_code, referred_by, is_admin)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-            ''', (user_id, username, full_name, datetime.now(), referral_code, referred_by, admin_status))
+                INSERT INTO users (user_id, username, full_name, registered_at, referral_code, referred_by)
+                VALUES (?, ?, ?, ?, ?, ?)
+            ''', (user_id, username, full_name, datetime.now(), referral_code, referred_by))
 
             if referred_by:
                 cursor.execute('''
@@ -180,17 +154,21 @@ class Database:
             self.conn.commit()
             return True
         except sqlite3.IntegrityError:
-            # Если пользователь уже существует, обновляем информацию
-            cursor.execute('''
-                UPDATE users SET username = ?, full_name = ?, is_admin = ? WHERE user_id = ?
-            ''', (username, full_name, admin_status, user_id))
-            self.conn.commit()
-            return True
+            return False
 
     def get_user(self, user_id):
         cursor = self.conn.cursor()
         cursor.execute('SELECT * FROM users WHERE user_id = ?', (user_id,))
         return cursor.fetchone()
+
+    def get_or_create_user(self, user_id, username=None, full_name=None):
+        """Получает пользователя или создает нового если не существует"""
+        user = self.get_user(user_id)
+        if not user:
+            if username and full_name:
+                self.add_user(user_id, username, full_name)
+                user = self.get_user(user_id)
+        return user
 
     def update_user_balance(self, user_id, amount):
         cursor = self.conn.cursor()
@@ -208,6 +186,16 @@ class Database:
         task_id = cursor.lastrowid
         self.conn.commit()
         return task_id
+
+    def get_all_tasks(self):
+        """Получает все задания"""
+        cursor = self.conn.cursor()
+        cursor.execute('''
+            SELECT * FROM tasks 
+            WHERE status != 'deleted'
+            ORDER BY task_id DESC
+        ''')
+        return cursor.fetchall()
 
     def get_active_tasks_for_user(self, user_id):
         """Получаем задания для конкретного пользователя с учетом КД и уже взятых"""
@@ -235,21 +223,73 @@ class Database:
         available_tasks = [task for task in all_tasks if task['task_id'] not in user_task_ids]
         return available_tasks
 
-    def get_all_tasks(self):
-        """Получает все задания"""
-        cursor = self.conn.cursor()
-        cursor.execute('SELECT * FROM tasks ORDER BY task_id DESC')
-        return cursor.fetchall()
-
     def get_task(self, task_id):
         cursor = self.conn.cursor()
         cursor.execute('SELECT * FROM tasks WHERE task_id = ?', (task_id,))
         return cursor.fetchone()
 
-    def update_task(self, task_id, field, value):
+    def update_task(self, task_id, category=None, link=None, total_count=None, 
+                   done_count=None, price_per_review=None, status=None):
+        """Обновляет задание"""
         cursor = self.conn.cursor()
-        cursor.execute(f'UPDATE tasks SET {field} = ? WHERE task_id = ?', (value, task_id))
+        
+        # Получаем текущие значения
+        task = self.get_task(task_id)
+        if not task:
+            return False
+        
+        # Подготавливаем обновления
+        updates = []
+        params = []
+        
+        if category is not None:
+            updates.append("category = ?")
+            params.append(category)
+        
+        if link is not None:
+            updates.append("link = ?")
+            params.append(link)
+        
+        if total_count is not None:
+            updates.append("total_count = ?")
+            params.append(total_count)
+        
+        if done_count is not None:
+            updates.append("done_count = ?")
+            params.append(done_count)
+        
+        if price_per_review is not None:
+            updates.append("price_per_review = ?")
+            params.append(price_per_review)
+        
+        if status is not None:
+            updates.append("status = ?")
+            params.append(status)
+        
+        if not updates:
+            return False
+        
+        params.append(task_id)
+        
+        cursor.execute(f'''
+            UPDATE tasks 
+            SET {', '.join(updates)}
+            WHERE task_id = ?
+        ''', params)
+        
         self.conn.commit()
+        return True
+
+    def delete_task(self, task_id):
+        """Мягкое удаление задания"""
+        cursor = self.conn.cursor()
+        cursor.execute('''
+            UPDATE tasks 
+            SET status = 'deleted'
+            WHERE task_id = ?
+        ''', (task_id,))
+        self.conn.commit()
+        return cursor.rowcount > 0
 
     def increment_task_done(self, task_id):
         cursor = self.conn.cursor()
@@ -364,7 +404,7 @@ class Database:
         ''', (index,))
         return cursor.fetchone()
 
-    def approve_review(self, review_id):
+    def approve_review(self, review_id, admin_id=None):
         cursor = self.conn.cursor()
 
         # Получаем информацию об отзыве
@@ -386,9 +426,9 @@ class Database:
         # Обновляем статус отзыва
         cursor.execute('''
             UPDATE reviews 
-            SET status = 'approved', checked_at = ?
+            SET status = 'approved', checked_at = ?, admin_id = ?
             WHERE review_id = ?
-        ''', (datetime.now(), review_id))
+        ''', (datetime.now(), admin_id, review_id))
 
         # Начисляем деньги исполнителю
         cursor.execute(
@@ -427,11 +467,16 @@ class Database:
             cursor.execute('UPDATE referrals SET earned = earned + ? WHERE referrer_id = ? AND referred_id = ?',
                            (bonus, referrer_id, user_id))
 
+        # Начисляем бонус администратору, если указан
+        if admin_id:
+            cursor.execute('UPDATE users SET balance = balance + ? WHERE user_id = ?', 
+                          (ADMIN_BONUS_PER_REVIEW, admin_id))
+
         self.conn.commit()
         return True
 
     def reject_review(self, review_id):
-        cursor = db.conn.cursor()
+        cursor = self.conn.cursor()
         cursor.execute('SELECT user_id, task_id FROM reviews WHERE review_id = ?', (review_id,))
         review = cursor.fetchone()
 
@@ -527,6 +572,14 @@ class Database:
         cursor.execute('SELECT COUNT(*) as count FROM payments WHERE status = "pending"')
         pending_payments = cursor.fetchone()['count']
 
+        # Общее количество отзывов
+        cursor.execute('SELECT COUNT(*) as count FROM reviews WHERE status = "approved"')
+        total_reviews = cursor.fetchone()['count']
+
+        # Общая сумма выплат
+        cursor.execute('SELECT SUM(amount) as total FROM payments WHERE status = "paid"')
+        total_paid = cursor.fetchone()['total'] or 0
+
         cursor.execute('''
             SELECT u.user_id, u.username, u.balance
             FROM users u
@@ -534,48 +587,6 @@ class Database:
             LIMIT 10
         ''')
         top_users = cursor.fetchall()
-
-        # Общее количество отзывов
-        cursor.execute('SELECT COUNT(*) as count FROM reviews')
-        total_reviews = cursor.fetchone()['count']
-
-        # Статистика выплат
-        cursor.execute('SELECT COUNT(*) as count, SUM(amount) as total FROM payments WHERE status = "paid"')
-        payment_stats = cursor.fetchone()
-        paid_payments = payment_stats['count'] or 0
-        paid_total = payment_stats['total'] or 0
-
-        # Статистика балансов админов
-        admin_ids_str = ','.join(str(id) for id in ADMIN_IDS)
-        if admin_ids_str:
-            cursor.execute(f'SELECT SUM(balance) as total FROM users WHERE user_id IN ({admin_ids_str})')
-        else:
-            cursor.execute('SELECT 0 as total')
-        admin_balance = cursor.fetchone()['total'] or 0
-
-        # Топ недели
-        cursor.execute('''
-            SELECT u.username, COUNT(r.review_id) as count 
-            FROM reviews r
-            JOIN users u ON r.user_id = u.user_id
-            WHERE r.status = 'approved' AND r.checked_at >= datetime('now', '-7 days')
-            GROUP BY r.user_id
-            ORDER BY count DESC
-            LIMIT 3
-        ''')
-        top_weekly = cursor.fetchall()
-
-        # Топ месяца
-        cursor.execute('''
-            SELECT u.username, COUNT(r.review_id) as count 
-            FROM reviews r
-            JOIN users u ON r.user_id = u.user_id
-            WHERE r.status = 'approved' AND r.checked_at >= datetime('now', '-30 days')
-            GROUP BY r.user_id
-            ORDER BY count DESC
-            LIMIT 3
-        ''')
-        top_monthly = cursor.fetchall()
 
         return {
             'users_count': users_count,
@@ -586,13 +597,42 @@ class Database:
             'pending_payments': pending_payments,
             'top_users': top_users,
             'total_reviews': total_reviews,
-            'paid_payments': paid_payments,
-            'paid_total': paid_total,
-            'admin_balance': admin_balance,
-            'top_weekly': top_weekly,
-            'top_monthly': top_monthly
+            'total_paid': total_paid
         }
+
+    def get_top_weekly(self, limit=3):
+        """Топ за неделю по количеству выполненных заданий"""
+        cursor = self.conn.cursor()
+        week_ago = datetime.now() - timedelta(days=7)
+        
+        cursor.execute('''
+            SELECT u.user_id, u.username, u.full_name, COUNT(r.review_id) as completed_count
+            FROM reviews r
+            JOIN users u ON r.user_id = u.user_id
+            WHERE r.status = 'approved' AND r.checked_at >= ?
+            GROUP BY u.user_id
+            ORDER BY completed_count DESC
+            LIMIT ?
+        ''', (week_ago, limit))
+        
+        return cursor.fetchall()
+
+    def get_top_monthly(self, limit=3):
+        """Топ за месяц по количеству выполненных заданий"""
+        cursor = self.conn.cursor()
+        month_ago = datetime.now() - timedelta(days=30)
+        
+        cursor.execute('''
+            SELECT u.user_id, u.username, u.full_name, COUNT(r.review_id) as completed_count
+            FROM reviews r
+            JOIN users u ON r.user_id = u.user_id
+            WHERE r.status = 'approved' AND r.checked_at >= ?
+            GROUP BY u.user_id
+            ORDER BY completed_count DESC
+            LIMIT ?
+        ''', (month_ago, limit))
+        
+        return cursor.fetchall()
 
     def close(self):
         self.conn.close()
-
