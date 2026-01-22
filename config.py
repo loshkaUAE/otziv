@@ -59,6 +59,9 @@ REFERRAL_PERCENTS = {
 # ===== КУЛДАУН ЗАДАНИЙ =====
 TASK_COOLDOWN_HOURS = 48  # Время скрытия задания после выполнения (в часах)
 
+# ===== БОНУСЫ АДМИНИСТРАТОРА =====
+ADMIN_BONUS_PER_REVIEW = 15  # Бонус администратора за одобренный отзыв
+
 # ===== ССЫЛКИ =====
 SUPPORT_USERNAME = "@JoelRathod"
 NEWS_CHANNEL = "https://t.me/otziv828"
@@ -101,6 +104,7 @@ def check_config():
     print("✅ Конфигурация загружена успешно!")
     print(f"   Администраторов: {len(ADMIN_IDS)}")
     print(f"   Токен: {'Установлен' if BOT_TOKEN else 'ОТСУТСТВУЕТ'}")
+    print(f"   Бонус админа за отзыв: {ADMIN_BONUS_PER_REVIEW}₽")
 
     return True
 
